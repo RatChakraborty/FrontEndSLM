@@ -23,6 +23,7 @@ from frontendslm.repair import (
     unit_repair_messages,
 )
 from frontendslm.schemas import Critique, validate_critique_references
+from frontendslm.thinking import AfterThinkingLogitsProcessor, critic_decoding_parameters
 
 
 def architect_decoding_parameters(*, repairing=False, patching=False, repair_decoding='greedy', output_mode='component'):
@@ -187,6 +188,11 @@ def generate_critiques(cases, baselines, config, output: Path, checkpoint):
     tokenizer_info = xgr.TokenizerInfo.from_huggingface(processor.tokenizer,
         vocab_size=model.config.text_config.vocab_size)
     compiler = xgr.GrammarCompiler(tokenizer_info)
+    output_mode = config.get('output_mode', 'json')
+    parameters = critic_decoding_parameters(output_mode)
+    end_thinking_id = processor.tokenizer.convert_tokens_to_ids('</think>') if output_mode == 'thinking' else None
+    if output_mode == 'thinking' and processor.tokenizer.convert_ids_to_tokens(end_thinking_id) != '</think>':
+        raise ValueError('Thinking Critic tokenizer lacks the expected final-answer boundary')
     results = []
     for baseline in baselines:
         for case in cases:
@@ -212,18 +218,25 @@ def generate_critiques(cases, baselines, config, output: Path, checkpoint):
             compact = compact_evidence(evidence, case["tests"], explicit_content_review=explicit_review)
             decode_schema = critic_output_schema(compact)
             grammar = compiler.compile_json_schema(decode_schema)
-            content.append({"type": "text", "text": json.dumps({"specification": case["spec"],
-                "evidence": compact, "output_schema": decode_schema}, ensure_ascii=False)})
+            payload = {"specification": case["spec"], "evidence": compact, "output_schema": decode_schema}
+            content.append({"type": "text", "text": json.dumps(payload, ensure_ascii=False)})
             instructions = CRITIC_INSTRUCTIONS + ('\n' + CONTENT_REVIEW_INSTRUCTIONS if explicit_review else '')
+            input_contract = {'instructions': instructions, 'payload': payload,
+                'image_sha256': {v: sha256((case_dir / 'render' / evidence['screenshots'][v]).read_bytes())
+                                 for v in ('desktop', 'mobile') if v in evidence.get('screenshots', {})}}
+            write_json(case_dir / 'critic_input.json', input_contract)
             messages = [{"role": "system", "content": instructions}, {"role": "user", "content": content}]
             text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             inputs = processor(text=[text], images=images or None, return_tensors="pt", padding=True).to(model.device)
             set_seed(42)
             torch.cuda.reset_peak_memory_stats()
             begin = time.monotonic()
+            grammar_processor = LogitsProcessor(grammar)
+            if output_mode == 'thinking':
+                grammar_processor = AfterThinkingLogitsProcessor(grammar_processor,
+                    prompt_length=inputs.input_ids.shape[1], end_thinking_id=end_thinking_id)
             with torch.inference_mode():
-                tokens = model.generate(**inputs, max_new_tokens=2500, do_sample=False,
-                    logits_processor=[LogitsProcessor(grammar)])
+                tokens = model.generate(**inputs, **parameters, logits_processor=[grammar_processor])
             torch.cuda.synchronize()
             elapsed = time.monotonic() - begin
             generated = tokens[0, inputs.input_ids.shape[1]:]
@@ -233,17 +246,29 @@ def generate_critiques(cases, baselines, config, output: Path, checkpoint):
                 "measured_checks": compact["measured_checks"], "measurement_validation": None,
                 "measurement_enforcement": "schema-required issues and verdict; not independent model detection",
                 "evidence_sha256": sha256(evidence_path.read_bytes()),
+                "input_contract_sha256": sha256(json.dumps(input_contract, sort_keys=True).encode()),
                 "seconds": elapsed, "input_tokens": inputs.input_ids.shape[1], "output_tokens": len(generated),
                 "peak_gpu_gib": torch.cuda.max_memory_allocated() / 2**30,
-                "generation_parameters": {"max_new_tokens": 2500, "do_sample": False, "seed": 42,
-                    "structured_decoding": "xgrammar==0.2.8", "output_schema": decode_schema},
-                "truncated": len(generated) >= 2500,
+                "generation_parameters": {**parameters, "seed": 42,
+                    "structured_decoding": "xgrammar==0.2.8", "output_schema": decode_schema,
+                    "constraint_phase": "after_thinking" if output_mode == 'thinking' else 'whole_answer'},
+                "output_protocol": "thinking-critic-v1" if output_mode == 'thinking' else 'constrained-critic',
+                "truncated": len(generated) >= parameters['max_new_tokens'],
                 "images": [v for v in ("desktop", "mobile") if v in evidence.get("screenshots", {})],
                 "image_processor": processor.image_processor.to_dict(), "prompt": text,
                 "human_grounding_precision": None, "human_grounding_recall": None}
             critique = None
             try:
-                critique = Critique.model_validate(parse_json_response(raw))
+                final_answer = raw
+                if output_mode == 'thinking':
+                    reasoning_ids, answer_ids = split_thinking_tokens(generated.tolist(), end_thinking_id)
+                    final_answer = processor.decode(answer_ids, skip_special_tokens=True)
+                    result.update(reasoning_text=processor.decode(reasoning_ids, skip_special_tokens=True),
+                                  final_answer=final_answer, thinking_end_token_id=end_thinking_id,
+                                  reasoning_output_tokens=len(reasoning_ids), answer_output_tokens=len(answer_ids))
+                if result['truncated']:
+                    raise ValueError('Critic exhausted its token budget; partial verdicts are not accepted')
+                critique = Critique.model_validate(parse_json_response(final_answer))
                 result.update(schema_valid=True, critique=critique.model_dump(),
                     reference_checks=validate_critique_references(critique, compact),
                     measurement_validation=validate_measured_critique(critique, compact))

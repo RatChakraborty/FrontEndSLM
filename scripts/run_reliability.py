@@ -19,6 +19,7 @@ from audit.source_units import localization_hints, source_catalog, validate_gene
 from frontendslm.evidence import compact_evidence
 from frontendslm.inference import architect_decoding_parameters
 from frontendslm.io import sha256, write_json
+from frontendslm.lineage import read_verified_generation, source_generation
 from frontendslm.repair import recover_repair_context
 
 
@@ -30,6 +31,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--source-run')
+    parser.add_argument('--source-round', type=int, choices=range(4), help='Select an explicit saved round from a repair run')
     parser.add_argument('--offset', type=int, default=0)
     parser.add_argument('--count', type=int, default=10)
     parser.add_argument('--max-revisions', type=int, default=2)
@@ -57,6 +59,8 @@ def main():
         raise ValueError('Keep bounded revisions (0–3) and batch size (1–20)')
     directory = ROOT / 'artifacts' / args.run_id
     source = ROOT / 'artifacts' / args.source_run if args.source_run else None
+    if args.source_round is not None and source is None:
+        raise ValueError('A source round requires a source run')
     if source and (source.parent != ROOT / 'artifacts' or source == directory):
         raise ValueError('Source must be another direct run directory')
     originals = modal_app.read_cases(50)
@@ -77,6 +81,8 @@ def main():
     candidate_filter = set(args.candidates.split(',')) if args.candidates else None
     if candidate_filter and not candidate_filter <= {f'{b}/{c}' for b in baselines for c in cases}:
         raise ValueError('Candidate filter names an unavailable case')
+    source_inputs = {f'{b}/{c}': source_generation(source, b, c, args.source_round)
+                     for b in baselines for c in cases if not candidate_filter or f'{b}/{c}' in candidate_filter} if source else {}
     if args.design_run:
         if not re.fullmatch(r'[a-zA-Z0-9_-]{1,80}', args.design_run):
             raise ValueError('Invalid design run ID')
@@ -90,8 +96,9 @@ def main():
     tracked = [*ROOT.glob('src/**/*.py'), *ROOT.glob('audit/*.*'), *ROOT.glob('sandbox/*.*'),
                *ROOT.glob('sandbox/src/*'), *ROOT.glob('design/*.*'), ROOT / 'modal_app.py', Path(__file__), ROOT / 'uv.lock', lock_path]
     hashes = {str(p.relative_to(ROOT)): sha256(p.read_bytes()) for p in sorted(tracked) if p.is_file()}
-    run = {'schema_version': '1.0', 'pipeline_version': '8.1', 'run_id': args.run_id,
+    run = {'schema_version': '1.0', 'pipeline_version': '8.3', 'audit_version': '2.1', 'run_id': args.run_id,
            'source_run': args.source_run, 'case_ids': list(cases), 'baselines': baselines,
+           'source_round': args.source_round, 'source_inputs': source_inputs,
            'model_lock': model_lock, 'architect_profile': args.architect_profile,
            'model_lock_file': str(lock_path.relative_to(ROOT)), 'gpu': 'L40S', 'source_sha256': hashes,
            'max_revisions': args.max_revisions, 'max_generation_attempts_per_round': 1,
@@ -104,7 +111,7 @@ def main():
            'acceptance': 'Complete functional audit and valid measured critic with effective accept verdict'}
     existing = read(directory / 'run.json')
     if existing:
-        for key in ('source_sha256', 'model_lock', 'architect_profile', 'case_ids', 'max_revisions', 'source_run', 'candidate_filter', 'design_run', 'design_intents', 'baselines', 'repair_strategy', 'repair_decoding', 'composition_example'):
+        for key in ('source_sha256', 'model_lock', 'architect_profile', 'case_ids', 'max_revisions', 'source_run', 'source_round', 'source_inputs', 'candidate_filter', 'design_run', 'design_intents', 'baselines', 'repair_strategy', 'repair_decoding', 'composition_example'):
             if existing[key] != run[key]:
                 raise ValueError(f'Resume settings/source changed: {key}')
     else:
@@ -171,7 +178,8 @@ def main():
             if round_number == 0 and source:
                 for job in jobs:
                     baseline, case_id = job['repair_baseline'], job['id']
-                    write_json(round_dir / baseline / case_id / 'generation.json', read(source / baseline / case_id / 'generation.json'))
+                    write_json(round_dir / baseline / case_id / 'generation.json',
+                               read_verified_generation(source, source_inputs[f'{baseline}/{case_id}']))
             else:
                 generated = modal_app.architect_batch.remote(jobs, baselines, model_lock, remote_id)
                 for row in generated:

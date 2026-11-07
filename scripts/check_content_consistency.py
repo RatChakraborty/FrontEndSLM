@@ -13,17 +13,21 @@ import modal
 
 import modal_app
 from frontendslm.io import sha256, write_json
+from frontendslm.thinking import critic_decoding_parameters
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--explicit-content-review', action='store_true')
+    parser.add_argument('--critic-profile', choices=['instruct', 'thinking'], default='instruct')
+    parser.add_argument('--prepare-models', action='store_true')
     args = parser.parse_args()
     if not args.run_id.replace('-', '').replace('_', '').isalnum():
         raise ValueError('Use a direct run ID')
     output = ROOT / 'artifacts' / args.run_id
-    model_lock = {role: dict(config) for role, config in modal_app.MODEL_LOCK.items()}
+    lock_path = ROOT / 'configs' / ('models-dual-thinking.lock.json' if args.critic_profile == 'thinking' else 'models.lock.json')
+    model_lock = json.loads(lock_path.read_text())
     model_lock['critic']['explicit_content_review'] = args.explicit_content_review
     if output.exists():
         raise ValueError('Preserve previous results; choose a new run ID')
@@ -49,15 +53,17 @@ def main():
             'expected_role': expectation, 'expectation_author': 'assistant development review; not human labeling',
             'source_files_sha256': {str(p.relative_to(path)): sha256(p.read_bytes())
                                     for p in sorted(path.rglob('*')) if p.is_file()}})
-    files = list(ROOT.glob('src/**/*.py')) + [Path(__file__), ROOT / 'modal_app.py', ROOT / 'configs/models.lock.json']
+    files = list(ROOT.glob('src/**/*.py')) + [Path(__file__), ROOT / 'modal_app.py', lock_path]
+    parameters = critic_decoding_parameters(model_lock['critic'].get('output_mode', 'json'))
     run = {'run_id': args.run_id, 'declared_at': datetime.now(UTC).isoformat(),
         'protocol': 'explicit-content-review-v2' if args.explicit_content_review else 'readable-copy-and-assertions-v1',
         'source_run': source.name,
-        'model_lock': model_lock, 'gpu': 'L40S', 'max_critic_tokens': 2500,
+        'model_lock': model_lock, 'gpu': 'L40S', 'critic_profile': args.critic_profile,
+        'generation_parameters': parameters,
         'source_sha256': {str(p.relative_to(ROOT)): sha256(p.read_bytes()) for p in files},
-        'hypothesis': 'Compare initial copy with measured assertions, optionally requiring explicit reviews before the verdict.',
-        'changed': ['Readable screen text and executed assertions', 'Optional explicit review schema and validation'],
-        'unchanged': ['Model checkpoint and decoding', 'All source, screenshots, measured tests and required workflows'],
+        'hypothesis': 'A reasoning-capable 4B Critic can detect contradictions missed by the 4B Instruct checkpoint.',
+        'changed': ['Selected Critic checkpoint, template, decoding and total token budget'],
+        'unchanged': ['All source, screenshots, measured tests, required workflows and critic prompt constructor'],
         'success_gate': 'Detect the stale-copy contradiction, retain four controls, and cover the original measured failure.',
         'label_separation': 'Provenance expectations are scoring metadata only; never passed to critic_batch.',
         'limitations': ['Six reused development cases; no independent accuracy or human grounding estimate',
@@ -67,6 +73,8 @@ def main():
     write_json(output / 'run.json', run)
     write_json(output / 'cases.json', list(cases.values()))
     with modal.enable_output(), modal_app.app.run():
+        if args.prepare_models:
+            write_json(output / 'download.json', modal_app.download_models.remote({'critic': model_lock['critic']}))
         with modal_app.results.batch_upload(force=True) as batch:
             batch.put_directory(output, f'/{args.run_id}')
         rows = modal_app.critic_batch.remote(list(cases.values()), ['repaired', 'control', 'original'],

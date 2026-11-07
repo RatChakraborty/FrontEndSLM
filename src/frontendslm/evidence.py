@@ -199,6 +199,7 @@ def measured_checks(evidence: dict, expected_tests: list[dict] | None = None) ->
 
 ASSERTION_SEMANTICS = {
     'expect_text': 'Target text contains the expected string; not an exact text or numeric equality check.',
+    'expect_text_exact': 'Target text equals the expected string after Playwright whitespace normalization.',
     'expect_count': 'Locator count equals the expected integer.',
     'expect_visible': 'Target locator is visible.',
     'expect_hidden': 'Target locator is hidden or absent.',
@@ -209,7 +210,8 @@ def passed_assertions(evidence: dict) -> list[dict]:
     """Expose executed assertions, never promote test plans or clicks to observations."""
     return [{'test_ref': test['id'], 'step_index': index, 'action': step['action'],
              'test_id': step.get('test_id'), 'expected': step.get('value', ''),
-             'semantics': ASSERTION_SEMANTICS[step['action']]}
+             'semantics': ASSERTION_SEMANTICS[step['action']],
+             **({'observation': step['observation']} if 'observation' in step else {})}
             for test in evidence.get('tests', []) for index, step in enumerate(test.get('steps', []))
             if step.get('passed') is True and step.get('action') in ASSERTION_SEMANTICS]
 

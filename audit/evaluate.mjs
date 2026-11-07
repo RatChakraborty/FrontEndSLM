@@ -7,7 +7,7 @@ import AxeBuilder from '@axe-core/playwright';
 const task = JSON.parse(fs.readFileSync('/work/task.json', 'utf8'));
 const out = '/work/result';
 fs.mkdirSync(out, { recursive: true });
-const report = { schema_version: '1.0', audit_version: '2.0', build: null, views: {}, tests: [], references: [],
+const report = { schema_version: '1.0', audit_version: '2.1', build: null, views: {}, tests: [], references: [],
   runtime_errors: [], console_errors: [], failed_requests: [], screenshots: {},
   limitations: ['Automated accessibility is incomplete.', 'Keyboard focus traces require human interpretation.', 'Visual quality and critique precision require independent human labels.'] };
 const save = () => fs.writeFileSync(`${out}/evidence.json`, JSON.stringify(report));
@@ -83,6 +83,13 @@ try {
             const first = instruction.test_id.endsWith(':first');
             let locator = page.getByTestId(instruction.test_id.replace(/:first$/, ''));
             if (first) locator = locator.first();
+            const observeText = async () => {
+              if (!['expect_text', 'expect_text_exact'].includes(instruction.action)) return {};
+              const values = await locator.allTextContents();
+              return { observation: { kind: 'text_content_after_assertion',
+                values: values.slice(0, 20).map(value => value.slice(0, 2000)),
+                truncated: values.length > 20 || values.some(value => value.length > 2000) } };
+            };
             try {
               switch (instruction.action) {
                 case 'click': await locator.click(); break;
@@ -101,10 +108,11 @@ try {
                 case 'expect_visible': await expect(locator).toBeVisible(); break;
                 case 'expect_hidden': await expect(locator).toBeHidden(); break;
                 case 'expect_text': await expect(locator).toContainText(instruction.value); break;
+                case 'expect_text_exact': await expect(locator).toHaveText(instruction.value); break;
                 case 'expect_count': await expect(locator).toHaveCount(Number(instruction.value)); break;
                 default: throw new Error(`Unknown action ${instruction.action}`);
               }
-              result.steps.push({ ...instruction, passed: true });
+              result.steps.push({ ...instruction, passed: true, ...await observeText() });
               // Scan every state-changing step; final-state-only scans miss open dialogs and Night mode.
               if (['click', 'click_if_enabled', 'fill', 'select', 'press'].includes(instruction.action)) {
                 const stateRef = `${result.id}:step-${stepIndex}`;
@@ -122,7 +130,8 @@ try {
               }
             } catch (error) {
               result.passed = false;
-              result.steps.push({ ...instruction, passed: false, error: error.message.slice(0, 1500) });
+              const observation = await observeText().catch(error => ({ observation_error: error.message }));
+              result.steps.push({ ...instruction, passed: false, error: error.message.slice(0, 1500), ...observation });
               break;
             }
           }

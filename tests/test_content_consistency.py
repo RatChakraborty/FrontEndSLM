@@ -99,3 +99,21 @@ def test_explicit_review_stays_opt_in_after_failed_model_regression():
     evidence['evidence_protocol'] = 'readable-copy-and-assertions-v1'
     assert validate_measured_critique(ordinary, evidence)['valid']
     assert 'content_reviews' not in critic_output_schema(evidence)['required']
+
+
+def test_exact_assertion_keeps_observed_text_separate_from_expected_text():
+    evidence = measured_fixture()
+    evidence['tests'][1]['steps'] = [
+        {'action': 'expect_text_exact', 'test_id': 'quantity', 'value': '3', 'passed': True,
+         'observation': {'kind': 'text_content_after_assertion', 'values': ['3'], 'truncated': False}},
+        {'action': 'expect_text_exact', 'test_id': 'quantity', 'value': '1', 'passed': False,
+         'observation': {'kind': 'text_content_after_assertion', 'values': ['11'], 'truncated': False}},
+    ]
+    evidence['tests'][1]['passed'] = False
+    compact = compact_evidence(evidence)
+    assert len(compact['passed_assertions']) == 1
+    assert compact['passed_assertions'][0]['observation']['values'] == ['3']
+    assert 'equals' in compact['passed_assertions'][0]['semantics']
+    interaction = next(c for c in compact['measured_checks'] if c['id'] == 'interaction')
+    assert interaction['status'] == 'fail'
+    assert interaction['details']['tests'][1]['steps'][1]['observation']['values'] == ['11']

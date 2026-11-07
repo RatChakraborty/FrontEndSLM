@@ -52,4 +52,12 @@ def audit_case(case):
                    s('expect_text', 'saved-note', 'Second note'), s('expect_focused', 'open-dialog')],
     }[kind]
     case['tests'].append({'id': f"{case['id']}-edge-cases", 'steps': extra})
+    # Numeric readouts expose their value at these test targets. Substring checks
+    # would incorrectly accept 13 when the required quantity is 3.
+    if kind in {'stepper', 'cart'}:
+        target = 'quantity' if kind == 'stepper' else 'cart-count'
+        for test in case['tests']:
+            for instruction in test['steps']:
+                if instruction['action'] == 'expect_text' and instruction['test_id'] == target:
+                    instruction['action'] = 'expect_text_exact'
     return case
